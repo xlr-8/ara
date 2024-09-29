@@ -8,7 +8,6 @@ Table of Contents
 .. toctree::
     :maxdepth: 3
 
-    Introduction <introduction>
     Getting started <getting-started>
     Ansible: configuration to use ARA <ansible-configuration>
     Ansible: plugins and use cases <ansible-plugins-and-use-cases>
@@ -21,5 +20,6 @@ Table of Contents
     CLI: ara and ara-manage <cli>
     Contributing to ARA <contributing>
     Frequently asked questions <faq>
+    Ansible metrics with Prometheus <prometheus>
     Troubleshooting <troubleshooting>
     Changelog and release notes <changelog-release-notes>
