@@ -6,6 +6,7 @@ import sys
 import time
 from collections import defaultdict
 from datetime import datetime, timedelta
+from enum import Enum
 
 from cliff.command import Command
 
@@ -14,7 +15,7 @@ from ara.cli.base import global_arguments
 from ara.clients.utils import get_client
 
 try:
-    from prometheus_client import Gauge, Summary, start_http_server
+    from prometheus_client import Histogram, Gauge, Summary, start_http_server
 
     HAS_PROMETHEUS_CLIENT = True
 except ImportError:
@@ -24,6 +25,7 @@ except ImportError:
 # queries to filter and aggregate by these properties
 # TODO: make configurable
 DEFAULT_PLAYBOOK_LABELS = [
+    "id",
     "ansible_version",
     "client_version",
     "controller",
@@ -31,12 +33,11 @@ DEFAULT_PLAYBOOK_LABELS = [
     "path",
     "python_version",
     "server_version",
-    "status",
-    "updated",
     "user",
 ]
-DEFAULT_TASK_LABELS = ["action", "name", "path", "playbook", "status", "updated"]
-DEFAULT_HOST_LABELS = ["name", "playbook", "updated"]
+
+DEFAULT_TASK_LABELS = ["action", "name", "tags", "path", "playbook", "play"]
+DEFAULT_HOST_LABELS = ["name", "playbook"]
 
 
 # TODO: This could be made more flexible and live in a library
@@ -64,6 +65,13 @@ def get_search_results(client, kind, limit, created_after):
     return items
 
 
+class AraStatus(Enum):
+    running = 1
+    completed = 2
+    failed = 3
+    skipped = 4
+
+
 class AraPlaybookCollector(object):
     def __init__(self, client, log, limit, labels=DEFAULT_PLAYBOOK_LABELS):
         self.client = client
@@ -72,13 +80,12 @@ class AraPlaybookCollector(object):
         self.labels = labels
 
         self.metrics = {
-            "range": Gauge("ara_playbooks_range", "Limit metric collection to the N most recent playbooks"),
-            "total": Gauge("ara_playbooks_total", "Total number of playbooks recorded by ara"),
-            "playbooks": Summary(
-                "ara_playbooks", "Labels and duration (in seconds) of playbooks recorded by ara", labels
-            ),
+            "status": Histogram("ara_playbooks_status", "Status of the plabyook's execution", labels),
+            "tasks": Histogram("ara_playbooks_tasks", "Amount of tasks ran within a playbook's execution", labels),
+            "results": Histogram("ara_playbooks_results", "Results of the playbook's exectuion", labels),
+            "hosts": Histogram("ara_playbooks_hosts", "Amount of hosts targeted by the playbook's execution", labels),
+            "duration": Histogram("ara_playbooks_duration", "Duration of the playbook's execution", labels),
         }
-        self.metrics["range"].set(self.limit)
 
     def collect_metrics(self, created_after=None):
         playbooks = get_search_results(self.client, "playbooks", self.limit, created_after)
@@ -102,9 +109,21 @@ class AraPlaybookCollector(object):
 
             # Gather the values of each label so we can attach them to our metrics
             labels = {label: playbook[label] for label in self.labels}
+            self.metrics["duration"].labels(**labels).observe(seconds)
 
-            self.metrics["playbooks"].labels(**labels).observe(seconds)
-            self.metrics["total"].inc()
+            if playbook["status"] is not None:
+                try:
+                    status = AraStatus[playbook["status"]].value
+                except KeyError:
+                    status = -1
+                self.metrics["status"].labels(**labels).observe(status)
+            if playbook["items"] is not None:
+                if playbook["items"]["results"] is not None:
+                    self.metrics["results"].labels(**labels).observe(playbook["items"]["results"])
+                if playbook["items"]["hosts"] is not None:
+                    self.metrics["hosts"].labels(**labels).observe(playbook["items"]["hosts"])
+                if playbook["items"]["tasks"] is not None:
+                    self.metrics["tasks"].labels(**labels).observe(playbook["items"]["tasks"])
 
         return created_after
 
@@ -117,11 +136,10 @@ class AraTaskCollector(object):
         self.labels = labels
 
         self.metrics = {
-            "range": Gauge("ara_tasks_range", "Limit metric collection to the N most recent tasks"),
-            "total": Gauge("ara_tasks_total", "Number of tasks recorded by ara in prometheus"),
-            "tasks": Summary("ara_tasks", "Labels and duration, in seconds, of playbook tasks recorded by ara", labels),
+            "duration": Histogram("ara_tasks_duration", "Duration of tasks recorded by ara in prometheus", labels),
+            "status": Histogram("ara_tasks_status", "Status of tasks recorded by ara in prometheus", labels),
+            "results": Histogram("ara_tasks_results", "Results of tasks recorded by ara in prometheus", labels),
         }
-        self.metrics["range"].set(self.limit)
 
     def collect_metrics(self, created_after=None):
         tasks = get_search_results(self.client, "tasks", self.limit, created_after)
@@ -131,8 +149,10 @@ class AraTaskCollector(object):
             self.log.info(f"updating metrics for {len(tasks)} tasks...")
 
         for task in tasks:
+            labels = {label: task[label] for label in self.labels}
             # The API returns a duration in string format, convert it back to seconds
             # so we can use it as a value for the metric.
+            seconds = 0
             if task["duration"] is not None:
                 # TODO: parse_timedelta throws an exception for tasks that last longer than a day
                 # That was meant to be fixed in https://github.com/ansible-community/ara/commit/db8243c3af938ece12c9cd59dd7fe4d9a711b76d
@@ -140,14 +160,17 @@ class AraTaskCollector(object):
                     seconds = cli_utils.parse_timedelta(task["duration"])
                 except ValueError:
                     seconds = 0
-            else:
-                seconds = 0
+            self.metrics["duration"].labels(**labels).observe(seconds)
 
             # Gather the values of each label so we can attach them to our metrics
-            labels = {label: task[label] for label in self.labels}
-
-            self.metrics["tasks"].labels(**labels).observe(seconds)
-            self.metrics["total"].inc()
+            if task["status"] is not None:
+                try:
+                    status = AraStatus[task["status"]].value
+                except KeyError:
+                    status = -1
+                self.metrics["status"].labels(**labels).observe(status)
+            if task["items"]["results"] is not None:
+                self.metrics["results"].labels(**labels).observe(task["items"]["results"])
 
         return created_after
 
@@ -160,15 +183,13 @@ class AraHostCollector(object):
         self.labels = labels
 
         self.metrics = {
-            "changed": Gauge("ara_hosts_changed", "Number of changes on a host", labels),
-            "failed": Gauge("ara_hosts_failed", "Number of failures on a host", labels),
-            "ok": Gauge("ara_hosts_ok", "Number of successful tasks without changes on a host", labels),
-            "range": Gauge("ara_hosts_range", "Limit metric collection to the N most recent hosts"),
-            "skipped": Gauge("ara_hosts_skipped", "Number of skipped tasks on a host", labels),
-            "total": Gauge("ara_hosts_total", "Hosts recorded by ara"),
-            "unreachable": Gauge("ara_hosts_unreachable", "Number of unreachable errors on a host", labels),
+            "changed": Histogram("ara_hosts_changed", "Number of changes on a host", labels),
+            "failed": Histogram("ara_hosts_failed", "Number of failures on a host", labels),
+            "ok": Histogram("ara_hosts_ok", "Number of successful tasks without changes on a host", labels),
+            "skipped": Histogram("ara_hosts_skipped", "Number of skipped tasks on a host", labels),
+            "unreachable": Histogram("ara_hosts_unreachable", "Number of unreachable errors on a host", labels),
+            "updated": Histogram("ara_hosts_updated", "Number of unreachable errors on a host", labels),
         }
-        self.metrics["range"].set(self.limit)
 
     def collect_metrics(self, created_after=None):
         hosts = get_search_results(self.client, "hosts", self.limit, created_after)
@@ -178,8 +199,6 @@ class AraHostCollector(object):
             self.log.info(f"updating metrics for {len(hosts)} hosts...")
 
         for host in hosts:
-            self.metrics["total"].inc()
-
             # Gather the values of each label so we can attach them to our metrics
             labels = {label: host[label] for label in self.labels}
 
@@ -187,7 +206,12 @@ class AraHostCollector(object):
             # use them as values for our metric
             for status in ["changed", "failed", "ok", "skipped", "unreachable"]:
                 if host[status]:
-                    self.metrics[status].labels(**labels).set(host[status])
+                    self.metrics[status].labels(**labels).observe(host[status])
+
+            if host["updated"] is not None:
+                dt = datetime.strptime(host["updated"], "%Y-%m-%dT%H:%M:%S.%fZ")
+                seconds = dt.timestamp()
+                self.metrics["updated"].labels(**labels).observe(seconds)
 
         return created_after
 
@@ -260,8 +284,8 @@ class PrometheusExporter(Command):
         )
 
         # Prepare collectors so we can gather various metrics
-        playbooks = AraPlaybookCollector(client=client, log=self.log, limit=args.playbook_limit)
         hosts = AraHostCollector(client=client, log=self.log, limit=args.host_limit)
+        playbooks = AraPlaybookCollector(client=client, log=self.log, limit=args.playbook_limit)
         tasks = AraTaskCollector(client=client, log=self.log, limit=args.task_limit)
 
         start_http_server(args.prometheus_port)
@@ -274,8 +298,8 @@ class PrometheusExporter(Command):
 
         latest = defaultdict(lambda: created_after)
         while True:
-            latest["playbooks"] = playbooks.collect_metrics(latest["playbooks"])
             latest["hosts"] = hosts.collect_metrics(latest["hosts"])
+            latest["playbooks"] = playbooks.collect_metrics(latest["playbooks"])
             latest["tasks"] = tasks.collect_metrics(latest["tasks"])
 
             time.sleep(args.poll_frequency)
